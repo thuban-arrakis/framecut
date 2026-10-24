@@ -1,0 +1,30 @@
+out/
+build/
+release/
+qa/
+*.user
+*.log
+.DS_Store
+
+# Alternate CMake build trees and local configuration
+/build-*/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/install_manifest.txt
+/CTestTestfile.cmake
+/Testing/
+/Makefile
+/build.ninja
+/.ninja_*
+/compile_commands.json
+CMakeUserPresets.json
+*.app/
+
+# Python helper caches and temporary editor files
+__pycache__/
+*.py[cod]
+*~
+*.swp
+*.swo

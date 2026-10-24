@@ -1,0 +1,8 @@
+# Keep source, scripts, and translations portable between macOS and Debian.
+* text=auto eol=lf
+
+# These small runtime assets are intentionally versioned in ordinary Git.
+*.png binary
+*.icns binary
+*.mp4 binary
+*.qm binary

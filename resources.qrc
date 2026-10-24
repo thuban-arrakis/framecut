@@ -1,0 +1,7 @@
+<RCC><qresource prefix="/assets">
+  <file alias="icon.png">assets/icon.png</file>
+  <file alias="sample.mp4">assets/sample.mp4</file>
+</qresource><qresource prefix="/translations">
+  <file alias="framecut_ru.qm">translations/framecut_ru.qm</file>
+  <file alias="qtbase_ru.qm">translations/qtbase_ru.qm</file>
+</qresource></RCC>

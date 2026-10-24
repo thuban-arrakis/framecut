@@ -1,0 +1,13 @@
+ARG DEBIAN_RELEASE=bookworm
+FROM debian:${DEBIAN_RELEASE}-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config qt6-base-dev qt6-multimedia-dev \
+    libavutil-dev libswscale-dev ffmpeg ca-certificates fonts-dejavu-core \
+    dpkg-dev file xvfb xauth x11-utils \
+    && apt-get clean
+WORKDIR /src
+ENV QT_QPA_PLATFORM=offscreen
+ENV QT_MEDIA_BACKEND=ffmpeg
+ENV QT_FFMPEG_DECODING_HW_DEVICE_TYPES=,
+ENV QT_DISABLE_HW_TEXTURES_CONVERSION=1
+CMD ["/bin/sh"]

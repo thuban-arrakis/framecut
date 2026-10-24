@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Framecut
+Comment=Trim video and remove audio
+Comment[ru]=Обрезка видео и удаление звука
+Exec=framecut
+Icon=framecut
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+Keywords=video;editor;trim;silent;audio;
+StartupWMClass=framecut
