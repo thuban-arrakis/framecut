@@ -38,12 +38,22 @@ int main(int argc, char **argv) {
     parser.addPositionalArgument("video", "Local video to open.", "[video]");
     parser.process(app);
 
-    const QString cacheRoot = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    QDir().mkpath(cacheRoot);
+    const QString cacheRoot = qEnvironmentVariable("FRAMECUT_CACHE_DIR",
+        QStandardPaths::writableLocation(QStandardPaths::CacheLocation));
+    if (cacheRoot.isEmpty() || !QDir().mkpath(cacheRoot)) {
+        qCritical("Could not create the preview cache directory.");
+        return 1;
+    }
     QTemporaryDir session(cacheRoot + "/session-XXXXXX");
-    if (!session.isValid()) return 1;
+    if (!session.isValid()) {
+        qCritical("Could not create a temporary preview session.");
+        return 1;
+    }
     const QString samplePath = session.filePath("Coastal light.mp4");
-    QFile::copy(":/assets/sample.mp4", samplePath);
+    if (!QFile::copy(":/assets/sample.mp4", samplePath)) {
+        qCritical("Could not prepare the bundled sample video.");
+        return 1;
+    }
     MediaController controller(toolPath("ffmpeg"), toolPath("ffprobe"), session.path(), samplePath);
     MainWindow window(&controller);
     controller.setWindow(&window);

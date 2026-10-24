@@ -190,12 +190,19 @@ QString fileFingerprint(const QString &path)
 #ifdef Q_OS_MACOS
     const auto seconds = status.st_mtimespec.tv_sec;
     const auto nanoseconds = status.st_mtimespec.tv_nsec;
+    const auto changedSeconds = status.st_ctimespec.tv_sec;
+    const auto changedNanoseconds = status.st_ctimespec.tv_nsec;
 #else
     const auto seconds = status.st_mtim.tv_sec;
     const auto nanoseconds = status.st_mtim.tv_nsec;
+    const auto changedSeconds = status.st_ctim.tv_sec;
+    const auto changedNanoseconds = status.st_ctim.tv_nsec;
 #endif
-    return QStringLiteral("%1:%2:%3:%4:%5").arg(quint64(status.st_dev)).arg(quint64(status.st_ino))
-        .arg(qint64(status.st_size)).arg(qint64(seconds)).arg(qint64(nanoseconds));
+    // Modification time can be restored by other editors or copy tools. The
+    // filesystem change time still identifies a rewrite of the same inode.
+    return QStringLiteral("%1:%2:%3:%4:%5:%6:%7").arg(quint64(status.st_dev)).arg(quint64(status.st_ino))
+        .arg(qint64(status.st_size)).arg(qint64(seconds)).arg(qint64(nanoseconds))
+        .arg(qint64(changedSeconds)).arg(qint64(changedNanoseconds));
 #else
     const QFileInfo file(path);
     return file.isFile() && !file.isSymLink() ? QStringLiteral("%1:%2").arg(file.size()).arg(file.lastModified().toMSecsSinceEpoch()) : QString{};
@@ -366,7 +373,11 @@ MediaResult MediaEngine::importMedia(const QString &path, const CancelFlag &canc
         QStringList arguments = ffmpegBase();
         arguments += localInput;
         arguments += {QStringLiteral("-hwaccel"), QStringLiteral("none"), QStringLiteral("-threads"), QStringLiteral("2"),
-            QStringLiteral("-i"), media.path, QStringLiteral("-map"), QStringLiteral("0:%1").arg(media.videoStreamIndex),
+            QStringLiteral("-i"), media.path,
+            // Audio can outlast the video by hours; the editor only needs a
+            // preview of the video's selectable range.
+            QStringLiteral("-t"), QString::number(media.duration, 'f', 9),
+            QStringLiteral("-map"), QStringLiteral("0:%1").arg(media.videoStreamIndex),
             QStringLiteral("-map"), QStringLiteral("0:a:0?"), QStringLiteral("-sn"), QStringLiteral("-dn"),
             QStringLiteral("-vf"), filter, QStringLiteral("-c:v"), QStringLiteral("libx264"),
             QStringLiteral("-preset"), QStringLiteral("veryfast"), QStringLiteral("-crf"), QStringLiteral("25"),
@@ -381,8 +392,9 @@ MediaResult MediaEngine::importMedia(const QString &path, const CancelFlag &canc
     media.thumbnailPath = directory.filePath(QStringLiteral("thumbnail.jpg"));
     QStringList thumbnailArguments = ffmpegBase();
     thumbnailArguments += localInput;
+    // Decode the first frame. Seeking a fraction into a one-frame clip skips
+    // its only frame, and unnecessarily rejects an otherwise valid video.
     thumbnailArguments += {QStringLiteral("-hwaccel"), QStringLiteral("none"), QStringLiteral("-threads"), QStringLiteral("2"),
-        QStringLiteral("-ss"), QString::number(std::min(0.25, media.duration / 4.0), 'f', 5),
         QStringLiteral("-i"), media.previewPath, QStringLiteral("-map"),
         media.previewTranscoded ? QStringLiteral("0:v:0") : QStringLiteral("0:%1").arg(media.videoStreamIndex),
         QStringLiteral("-frames:v"), QStringLiteral("1"), QStringLiteral("-vf"), QStringLiteral("scale=640:360:force_original_aspect_ratio=decrease"),

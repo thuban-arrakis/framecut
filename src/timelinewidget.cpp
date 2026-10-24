@@ -53,10 +53,18 @@ void TimelineWidget::setMedia(const MediaInfo *media) {
     update();
 }
 void TimelineWidget::setPosition(double seconds) {
+    if (!std::isfinite(seconds))
+        return;
     const double previous = m_position;
     m_position = qBound(0., seconds, m_duration);
-    if (previous != m_position)
-        update();
+    if (previous != m_position) {
+        // Only the old and new playhead columns change during playback. Avoid
+        // repainting the entire thumbnail strip at every playback tick.
+        const auto headArea = [this](double time) {
+            return QRectF(pixelForSeconds(time) - 6, 19, 12, height() - 19).toAlignedRect();
+        };
+        update(QRegion(headArea(previous)) | QRegion(headArea(m_position)));
+    }
 }
 void TimelineWidget::setAudioRemoved(bool removed) {
     m_removed = removed;
@@ -310,7 +318,13 @@ void TimelineWidget::mousePressEvent(QMouseEvent *event) {
     }
 }
 void TimelineWidget::mouseMoveEvent(QMouseEvent *event) {
-    if (m_dragEdge != Edge::None)
+    // A release can be consumed by a window switch or modal UI. Do not keep
+    // changing the trim after the pointer returns with no button held.
+    if (!event->buttons().testFlag(Qt::LeftButton)) {
+        finishTrim(false);
+        m_scrubbing = false;
+        updateHover(event->position());
+    } else if (m_dragEdge != Edge::None)
         dragEdge(event->position().x());
     else if (m_scrubbing && event->buttons().testFlag(Qt::LeftButton))
         seekAt(event->position().x());

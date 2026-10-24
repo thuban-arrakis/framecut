@@ -39,6 +39,8 @@ python3 "$framecut_project_root/packaging/bundle_macos.py" "$framecut_app" --qt-
 python3 "$framecut_project_root/packaging/bundle_macos.py" "$framecut_app" --qt-prefix "$framecut_qt_prefix"
 python3 "$framecut_project_root/packaging/bundle_macos.py" "$framecut_app" --audit-only --arch "$framecut_arch"
 /bin/cp "$framecut_project_root/docs/third-party-notices.md" "$framecut_app/Contents/Resources/ThirdPartyNotices.md"
+mkdir -p "$framecut_app/Contents/Resources/licenses"
+/bin/cp "$framecut_project_root/docs/licenses/qt-translations-BSD-3-Clause.txt" "$framecut_app/Contents/Resources/licenses/"
 
 # Ad-hoc signatures use no identity/keychain credentials. They are for local builds.
 /usr/bin/codesign --force --deep --sign - "$framecut_app"

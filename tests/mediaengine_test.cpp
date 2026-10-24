@@ -1,6 +1,7 @@
 #include "mediaengine.h"
 
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -140,6 +141,42 @@ private slots:
         QVERIFY(!media.previewTranscoded);
         QCOMPARE(media.previewPath, QFileInfo(source).canonicalFilePath());
         QVERIFY(QFileInfo(media.thumbnailPath).size() > 0);
+    }
+
+    void singleFrameVideoCanBeImported()
+    {
+        const QString original = path(QStringLiteral("single-frame.mp4"));
+        const auto created = command(ffmpeg, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-nostdin"),
+            QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"), QStringLiteral("color=c=blue:size=160x90:rate=24"),
+            QStringLiteral("-frames:v"), QStringLiteral("1"), QStringLiteral("-c:v"), QStringLiteral("libx264"),
+            QStringLiteral("-pix_fmt"), QStringLiteral("yuv420p"), original});
+        QVERIFY2(created.ok, created.error.constData());
+        const auto imported = engine->importMedia(original, flag());
+        QVERIFY2(imported.ok, qPrintable(imported.error));
+        QVERIFY(imported.media.duration > 0 && imported.media.duration < 0.05);
+        QVERIFY(QFileInfo(imported.media.thumbnailPath).size() > 0);
+    }
+
+    void previewStopsAtVideoEndWhenAudioIsLonger()
+    {
+        const QString original = path(QStringLiteral("long-audio.mp4"));
+        const auto created = command(ffmpeg, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-nostdin"),
+            QStringLiteral("-i"), source, QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+            QStringLiteral("sine=frequency=440:duration=5"), QStringLiteral("-map"), QStringLiteral("0:v:0"),
+            QStringLiteral("-map"), QStringLiteral("1:a:0"), QStringLiteral("-vf"), QStringLiteral("scale=960:540"),
+            QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-preset"), QStringLiteral("ultrafast"),
+            QStringLiteral("-c:a"), QStringLiteral("aac"), original});
+        QVERIFY2(created.ok, created.error.constData());
+        const auto originalHash = QCryptographicHash::hash(fileBytes(original), QCryptographicHash::Sha256);
+        const auto imported = engine->importMedia(original, flag());
+        QVERIFY2(imported.ok, qPrintable(imported.error));
+        QVERIFY(imported.media.previewTranscoded);
+        const auto preview = inspect(imported.media.previewPath);
+        QCOMPARE(preview.value(QStringLiteral("streams")).toArray().size(), 2);
+        const double previewDuration = preview.value(QStringLiteral("format")).toObject()
+            .value(QStringLiteral("duration")).toString().toDouble();
+        QVERIFY(previewDuration > 1.2 && previewDuration < 1.35);
+        QCOMPARE(QCryptographicHash::hash(fileBytes(original), QCryptographicHash::Sha256), originalHash);
     }
 
     void exportRemovesAllAudioPreservesFramesAndOriginal()
@@ -451,6 +488,34 @@ private slots:
         file.close();
         const auto result = engine->exportSilent(imported.media, path(QStringLiteral("changed-silent.mp4")), flag());
         QVERIFY(!result.ok && result.error.contains(QStringLiteral("changed")));
+    }
+
+    void sourceRewriteWithRestoredModificationTimeIsDetected()
+    {
+#ifdef Q_OS_UNIX
+        const QString original = path(QStringLiteral("restored-timestamp.mp4"));
+        QVERIFY(QFile::copy(source, original));
+        QFile file(original);
+        QVERIFY(file.open(QIODevice::ReadWrite));
+        const QDateTime modified = QDateTime::fromSecsSinceEpoch(QDateTime::currentSecsSinceEpoch() - 3600);
+        QVERIFY(file.setFileTime(modified, QFileDevice::FileModificationTime));
+        file.close();
+        const auto imported = engine->importMedia(original, flag());
+        QVERIFY2(imported.ok, qPrintable(imported.error));
+        const QByteArray contents = fileBytes(original);
+        QVERIFY(write(original, contents));
+        QVERIFY(file.open(QIODevice::ReadWrite));
+        QVERIFY(file.setFileTime(modified, QFileDevice::FileModificationTime));
+        file.close();
+        QCOMPARE(QFileInfo(original).size(), imported.media.size);
+        QCOMPARE(QFileInfo(original).lastModified(), modified);
+        const QString target = path(QStringLiteral("restored-timestamp-export.mp4"));
+        const auto result = engine->exportSilent(imported.media, target, flag());
+        QVERIFY(!result.ok && result.error.contains(QStringLiteral("changed")));
+        QVERIFY(!QFileInfo::exists(target));
+#else
+        QSKIP("Filesystem change-time detection is supported on macOS and Linux.");
+#endif
     }
 
     void subtitlesChaptersAttachmentsAndSecondaryVideoArePreserved()

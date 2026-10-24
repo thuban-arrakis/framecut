@@ -20,6 +20,7 @@
 #include <QListWidget>
 #include <QMediaPlayer>
 #include <QMouseEvent>
+#include <QPaintEvent>
 #include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -31,7 +32,20 @@
 #include <QThreadPool>
 #include <QTabWidget>
 #include <QTimer>
+#include <QVideoFrameFormat>
 #include <cmath>
+#include <cstring>
+
+class PaintTracker final : public QObject {
+  public:
+    QRegion dirty;
+  protected:
+    bool eventFilter(QObject *, QEvent *event) override {
+        if (event->type() == QEvent::Paint)
+            dirty |= static_cast<QPaintEvent *>(event)->region();
+        return false;
+    }
+};
 
 class UiSmoke final : public QObject {
     Q_OBJECT
@@ -131,6 +145,92 @@ private slots:
         QVERIFY(audio->isMuted());
         QVERIFY(window->findChild<QPushButton *>("exportButton")->isEnabled());
         screenshot("02-loaded");
+    }
+
+    void timelinePlaybackRepaintsOnlyPlayhead() {
+        TimelineWidget timeline;
+        MediaInfo media;
+        media.duration = 8;
+        media.fps = 25;
+        timeline.setMedia(&media);
+        timeline.resize(900, 180);
+        PaintTracker tracker;
+        timeline.installEventFilter(&tracker);
+        timeline.show();
+        QTRY_VERIFY(!tracker.dirty.isEmpty());
+        QTest::qWait(30);
+        tracker.dirty = {};
+        timeline.setPosition(2.5);
+        QTRY_VERIFY(!tracker.dirty.isEmpty());
+        qint64 paintedArea = 0;
+        for (const auto &rect : tracker.dirty)
+            paintedArea += qint64(rect.width()) * rect.height();
+        QVERIFY(paintedArea < qint64(timeline.width()) * timeline.height() / 10);
+        QVERIFY(!tracker.dirty.contains(QPoint(20, 70))); // Track labels are unchanged.
+    }
+
+    void interruptedTrimStopsWhenMouseButtonIsReleased() {
+        TimelineWidget timeline;
+        MediaInfo media;
+        media.duration = 8;
+        media.fps = 25;
+        timeline.setMedia(&media);
+        timeline.resize(900, 180);
+        timeline.show();
+        QSignalSpy changes(&timeline, &TimelineWidget::trimRangeChanged);
+        QSignalSpy finished(&timeline, &TimelineWidget::trimGestureFinished);
+        const QPoint left = timeline.leftHandleRect().center().toPoint();
+        QTest::mousePress(&timeline, Qt::LeftButton, Qt::NoModifier, left);
+        const QPoint dragged = left + QPoint(100, 0);
+        QMouseEvent drag(QEvent::MouseMove, QPointF(dragged), QPointF(timeline.mapToGlobal(dragged)),
+                         Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&timeline, &drag);
+        QCOMPARE(changes.count(), 1);
+        const QRectF trimmed = timeline.clipRect();
+        const QPoint returned = dragged + QPoint(100, 0);
+        QMouseEvent returnedWithoutButton(QEvent::MouseMove, QPointF(returned),
+                                         QPointF(timeline.mapToGlobal(returned)),
+                                         Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(&timeline, &returnedWithoutButton);
+        QCOMPARE(timeline.clipRect(), trimmed);
+        QCOMPARE(changes.count(), 1);
+        QCOMPARE(finished.count(), 1);
+        QTest::mouseRelease(&timeline, Qt::LeftButton, Qt::NoModifier, returned);
+        QCOMPARE(changes.count(), 1);
+    }
+
+    void softwarePreviewHandlesOddFrameSizes_data() {
+        QTest::addColumn<int>("pixelFormat");
+        QTest::addColumn<QSize>("frameSize");
+        QTest::newRow("packed-rgb") << int(QVideoFrameFormat::Format_RGBX8888) << QSize(9, 7);
+        // Qt-owned subsampled fixtures need an even height to allocate complete
+        // chroma rows; an odd width still exercises chroma stride rounding.
+        QTest::newRow("planar-yuv") << int(QVideoFrameFormat::Format_YUV420P) << QSize(9, 8);
+        QTest::newRow("swapped-chroma") << int(QVideoFrameFormat::Format_YV12) << QSize(9, 8);
+        QTest::newRow("interleaved-chroma") << int(QVideoFrameFormat::Format_NV12) << QSize(9, 8);
+    }
+
+    void softwarePreviewHandlesOddFrameSizes() {
+        QFETCH(int, pixelFormat);
+        QFETCH(QSize, frameSize);
+        QVideoFrameFormat format(frameSize, QVideoFrameFormat::PixelFormat(pixelFormat));
+        format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+        QVideoFrame frame(format);
+        QVERIFY(frame.map(QVideoFrame::WriteOnly));
+        for (int plane = 0; plane < frame.planeCount(); ++plane)
+            std::memset(frame.bits(plane), 128, size_t(frame.mappedBytes(plane)));
+        frame.unmap();
+        PreviewWidget preview;
+        QSignalSpy presented(&preview, &PreviewWidget::framePresented);
+        preview.setFrame(frame);
+        QCOMPARE(presented.count(), 1);
+        const QImage image = preview.currentImage();
+        QCOMPARE(image.size(), frameSize);
+        const QColor lastPixel = image.pixelColor(frameSize.width() - 1, frameSize.height() - 1);
+        QVERIFY2(std::abs(lastPixel.red() - 128) <= 2, qPrintable(lastPixel.name(QColor::HexArgb)));
+        QVERIFY(std::abs(lastPixel.green() - 128) <= 2);
+        QVERIFY(std::abs(lastPixel.blue() - 128) <= 2);
+        QCOMPARE(lastPixel.alpha(), 255);
     }
 
     void exportThroughSaveDialog() {
@@ -368,12 +468,20 @@ private slots:
         QCOMPARE(controller->trimStart(), 0.0);
         QCOMPARE(controller->trimEnd(), duration);
         controller->setTrimRange(2, 5);
+        auto *library = window->findChild<QListWidget *>("mediaList");
+        QVERIFY(library);
+        QSignalSpy libraryResets(library->model(), &QAbstractItemModel::modelReset);
+        auto *firstItem = library->item(0);
+        auto *secondItem = library->item(1);
         controller->selectMedia(firstId);
         QCOMPARE(controller->trimStart(), 1.0);
         QCOMPARE(controller->trimEnd(), 4.0);
         controller->selectMedia(secondId);
         QCOMPARE(controller->trimStart(), 2.0);
         QCOMPARE(controller->trimEnd(), 5.0);
+        QCOMPARE(libraryResets.count(), 0);
+        QCOMPARE(library->item(0), firstItem);
+        QCOMPARE(library->item(1), secondItem);
         controller->removeCurrentMedia();
         QCOMPARE(controller->currentMedia()->id, firstId);
         QCOMPARE(controller->trimStart(), 1.0);

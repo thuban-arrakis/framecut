@@ -14,6 +14,7 @@
 extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
 
@@ -166,8 +167,10 @@ void PreviewWidget::setFrame(const QVideoFrame &input) {
     }
     QImage next;
     const auto direct = QVideoFrameFormat::imageFormatFromPixelFormat(frame.pixelFormat());
-    if (direct != QImage::Format_Invalid && frame.bits(0) && frame.bytesPerLine(0) > 0) {
-        next = QImage(frame.bits(0), frame.width(), frame.height(), frame.bytesPerLine(0), direct).copy();
+    if (direct != QImage::Format_Invalid) {
+        if (frame.bits(0) && frame.bytesPerLine(0) > 0 && frame.width() > 0 && frame.height() > 0 &&
+            qint64(frame.mappedBytes(0)) >= qint64(frame.bytesPerLine(0)) * frame.height())
+            next = QImage(frame.bits(0), frame.width(), frame.height(), frame.bytesPerLine(0), direct).copy();
     } else if (frame.pixelFormat() == QVideoFrameFormat::Format_Jpeg) {
         next = QImage::fromData(frame.bits(0), frame.mappedBytes(0), "JPG");
     } else {
@@ -185,7 +188,8 @@ void PreviewWidget::setFrame(const QVideoFrame &input) {
                     plane == 1 || plane == 2
                         ? (frame.height() + (1 << descriptor->log2_chroma_h) - 1) >> descriptor->log2_chroma_h
                         : frame.height();
-                if (!source[plane] || strides[plane] <= 0 ||
+                const int minimumStride = av_image_get_linesize(format, frame.width(), plane);
+                if (!source[plane] || minimumStride <= 0 || strides[plane] < minimumStride ||
                     qint64(frame.mappedBytes(plane)) < qint64(strides[plane]) * rows)
                     valid = false;
             }
@@ -194,8 +198,11 @@ void PreviewWidget::setFrame(const QVideoFrame &input) {
                 std::swap(strides[1], strides[2]);
             }
             if (valid) {
+                // The unscaled planar converter can omit the final column at
+                // odd widths. Use the general conversion path in that case.
+                const int flags = SWS_BILINEAR | ((frame.width() & 1) ? SWS_ACCURATE_RND : 0);
                 m_scaler = sws_getCachedContext(m_scaler, frame.width(), frame.height(), format,
-                                                frame.width(), frame.height(), AV_PIX_FMT_RGBA, SWS_BILINEAR,
+                                                frame.width(), frame.height(), AV_PIX_FMT_RGBA, flags,
                                                 nullptr, nullptr, nullptr);
                 if (m_scaler) {
                     int colorSpace = SWS_CS_DEFAULT;
@@ -209,11 +216,13 @@ void PreviewWidget::setFrame(const QVideoFrame &input) {
                                                  QVideoFrameFormat::ColorRange_Full,
                                              coefficients, 1, 0, 1 << 16, 1 << 16);
                     next = QImage(frame.size(), QImage::Format_RGBA8888);
-                    uint8_t *destination[4] = {next.bits(), nullptr, nullptr, nullptr};
-                    int destinationStrides[4] = {int(next.bytesPerLine()), 0, 0, 0};
-                    if (sws_scale(m_scaler, source, strides, 0, frame.height(), destination,
-                                  destinationStrides) <= 0)
-                        next = {};
+                    if (!next.isNull()) {
+                        uint8_t *destination[4] = {next.bits(), nullptr, nullptr, nullptr};
+                        int destinationStrides[4] = {int(next.bytesPerLine()), 0, 0, 0};
+                        if (sws_scale(m_scaler, source, strides, 0, frame.height(), destination,
+                                      destinationStrides) != frame.height())
+                            next = {};
+                    }
                 }
             }
         }

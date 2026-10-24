@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QList>
 #include <QHash>
+#include <QPointer>
 #include <QString>
 #include <memory>
 #include "mediaengine.h"
@@ -14,7 +15,8 @@ class MediaController final : public QObject {
 public:
     explicit MediaController(QString ffmpegPath, QString ffprobePath, QString cacheDir,
                              QString samplePath, QObject *parent = nullptr);
-    void setWindow(QWidget *window) { m_window = window; }
+    ~MediaController() override;
+    void setWindow(QWidget *window);
     const QList<MediaInfo> &library() const { return m_library; }
     const MediaInfo *currentMedia() const;
     bool busy() const { return m_busy; }
@@ -72,5 +74,5 @@ private:
     QString m_currentId, m_lastExport;
     bool m_busy = false, m_exporting = false, m_removeAudio = true;
     CancelFlag m_cancel;
-    QWidget *m_window = nullptr;
+    QPointer<QWidget> m_window;
 };
