@@ -219,6 +219,15 @@ private slots:
         QVERIFY(frame.map(QVideoFrame::WriteOnly));
         for (int plane = 0; plane < frame.planeCount(); ++plane)
             std::memset(frame.bits(plane), 128, size_t(frame.mappedBytes(plane)));
+        if (pixelFormat == int(QVideoFrameFormat::Format_RGBX8888)) {
+            // QImage::Format_RGBX8888 requires an opaque fourth byte. Set it
+            // explicitly; older Qt versions expose its value in pixelColor().
+            for (int y = 0; y < frame.height(); ++y) {
+                auto *row = frame.bits(0) + y * frame.bytesPerLine(0);
+                for (int x = 0; x < frame.width(); ++x)
+                    row[4 * x + 3] = 255;
+            }
+        }
         frame.unmap();
         PreviewWidget preview;
         QSignalSpy presented(&preview, &PreviewWidget::framePresented);
