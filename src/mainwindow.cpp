@@ -1157,20 +1157,43 @@ void MainWindow::refreshAudioOutput() {
 }
 void MainWindow::rebuildLibrary() {
     const QSignalBlocker block(m_library);
-    m_library->clear();
+    QHash<QString, QListWidgetItem *> existing;
+    for (int row = 0; row < m_library->count(); ++row) {
+        auto *item = m_library->item(row);
+        existing.insert(item->data(Qt::UserRole).toString(), item);
+    }
+    QListWidgetItem *selected = nullptr;
+    const auto *current = m_controller->currentMedia();
+    int row = 0;
     for (const auto &media : m_controller->library()) {
-        auto *item = new QListWidgetItem(media.name);
+        auto *item = existing.value(media.id);
+        if (!item) {
+            item = new QListWidgetItem;
+            m_library->insertItem(row, item);
+        } else if (m_library->item(row) != item) {
+            m_library->takeItem(m_library->row(item));
+            m_library->insertItem(row, item);
+        }
+        ++row;
+        item->setText(media.name);
         item->setData(Qt::UserRole, media.id);
         item->setData(Qt::UserRole + 1, timecode(media.duration).mid(3));
         item->setData(
             Qt::UserRole + 2,
             QString("%1 × %2  ·  %3").arg(media.width).arg(media.height).arg(byteSize(media.size)));
-        item->setData(Qt::DecorationRole, QPixmap(media.thumbnailPath));
+        // A selection change does not change the library. Keep its thumbnails
+        // and item identities instead of decoding every image again.
+        if (item->data(Qt::UserRole + 3).toString() != media.thumbnailPath) {
+            item->setData(Qt::DecorationRole, QPixmap(media.thumbnailPath));
+            item->setData(Qt::UserRole + 3, media.thumbnailPath);
+        }
         item->setToolTip(media.name);
-        m_library->addItem(item);
-        if (m_controller->currentMedia() && media.id == m_controller->currentMedia()->id)
-            m_library->setCurrentItem(item);
+        if (current && media.id == current->id)
+            selected = item;
     }
+    while (m_library->count() > row)
+        delete m_library->takeItem(row);
+    m_library->setCurrentItem(selected);
     m_library->setVisible(!m_controller->library().isEmpty());
     m_emptyLibrary->setVisible(m_controller->library().isEmpty());
     m_count->setText(QString::number(m_controller->library().size()));

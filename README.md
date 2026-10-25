@@ -35,6 +35,8 @@ QT_QPA_PLATFORM=offscreen ctest --test-dir out/macos-current --output-on-failure
 open out/macos-current/Framecut.app
 ```
 
+For a temporary review run, use `scripts/run-temporary-macos.sh /tmp/path/to/Framecut.app`. It keeps app settings, preview cache, and suggested exports in a fresh directory under `/tmp`; the directory is printed at launch. Temporary files may be removed by the operating system. The launcher does not install the app.
+
 Make a self-contained local app and zip:
 
 ```sh

@@ -43,6 +43,18 @@ CPack generated `framecut_0.3.0_arm64.deb` (616,910 bytes). Test logs are record
 
 The package successfully upgraded 0.2.0 in the isolated Debian container. The installed executable reported `Framecut 0.3.0` through X11/Xvfb and its SHA-256 matched the tested build. The release directory includes a SHA-256 checksum record for the package.
 
+## Post-0.3.0 robustness review
+
+On 24 October 2026, the local macOS review build passed three CTest suites: media engine (20 QtTest entries), controller lifecycle (5), and UI smoke (17), with no failures or skips. The same suites passed a separate Debug build with AddressSanitizer and UndefinedBehaviorSanitizer; leak detection was disabled. These counts include QtTest setup and cleanup entries. This revision has not yet been rebuilt or tested on Debian.
+
+New regression checks cover single-frame imports, previews whose source audio outlasts the video, same-size source rewrites with restored modification times, controller destruction during active inspection, progress delivery on the GUI thread, and destroyed dialog parents. UI checks cover retaining library items when switching clips, limited playhead repaint regions, interrupted trim drags, and complete pixel conversion at odd widths. The odd-width planar YUV check exposed an uninitialized final column, which is now corrected without changing the conversion path for even-width previews.
+
+Timeline repaint area is below one tenth of the whole widget in the 900×180 regression fixture. Unchanged library thumbnails are reused across selection changes. These checks verify reduced work; they are not an overall application CPU benchmark.
+
+Builds, test homes, caches, and the interactive review app were kept under `/tmp`. Startup with an unwritable cache directory exited cleanly with a diagnostic. The temporary launcher passed a version smoke check. Packaging shell syntax was checked, and package rules now include the Qt translation license beside the dependency notices; fresh distribution packages were not produced during this review.
+
+Local test logs are saved under `qa/macos-review/`, outside the tracked source files.
+
 ## Scope of validation
 
 Offscreen and Xvfb tests verify application behavior without a GPU-backed window; they do not establish performance or audio output in the fleet's desktop environment. The fleet's release remains unknown. The final pilot must use the actual Debian release, architecture, desktop environment, system configuration, and representative videos. Debian 13 and amd64 were not tested in this run.

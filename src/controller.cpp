@@ -5,8 +5,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFutureWatcher>
-#include <QMetaObject>
-#include <QPointer>
+#include <QPromise>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QUrl>
@@ -19,6 +18,14 @@ MediaController::MediaController(QString ffmpegPath, QString ffprobePath, QStrin
     : QObject(parent), m_engine(std::make_shared<MediaEngine>(std::move(ffmpegPath),
           std::move(ffprobePath), cacheDir)), m_samplePath(std::move(samplePath)),
       m_cacheDir(std::move(cacheDir)) {}
+
+MediaController::~MediaController() {
+    // The worker owns its engine and cancellation flag until it finishes. It
+    // must never depend on a surviving controller or window.
+    cancelOperation();
+}
+
+void MediaController::setWindow(QWidget *window) { m_window = window; }
 
 const MediaInfo *MediaController::currentMedia() const {
     for (const auto &media : m_library)
@@ -134,6 +141,8 @@ void MediaController::importFile(const QString &path) {
     emit busyChanged(true, tr("Preparing video preview…"));
     emit progressChanged(0);
     auto *watcher = new QFutureWatcher<MediaResult>(this);
+    connect(watcher, &QFutureWatcher<MediaResult>::progressValueChanged,
+            this, [this](int value) { emit progressChanged(value / 100.0); });
     connect(watcher, &QFutureWatcher<MediaResult>::finished, this, [this, watcher] {
         const MediaResult result = watcher->result();
         watcher->deleteLater();
@@ -156,15 +165,13 @@ void MediaController::importFile(const QString &path) {
         emit audioChanged(m_removeAudio);
         if (replaced) discardCachedMedia(previous);
     });
-    QPointer<MediaController> guard(this);
     const auto engine = m_engine;
     const auto cancel = m_cancel;
-    watcher->setFuture(QtConcurrent::run([engine, absolute, cancel, guard] {
-        return engine->importMedia(absolute, cancel, [guard](double percent) {
-            if (guard) QMetaObject::invokeMethod(guard, [guard, percent] {
-                if (guard) emit guard->progressChanged(percent);
-            }, Qt::QueuedConnection);
-        });
+    watcher->setFuture(QtConcurrent::run([engine, absolute, cancel](QPromise<MediaResult> &promise) {
+        promise.setProgressRange(0, 10000);
+        promise.addResult(engine->importMedia(absolute, cancel, [&promise](double percent) {
+            if (std::isfinite(percent)) promise.setProgressValue(qRound(qBound(0.0, percent, 100.0) * 100));
+        }));
     }));
 }
 
@@ -237,7 +244,10 @@ void MediaController::exportVideo() {
     const QString extension = trimmed ? QStringLiteral("mp4") : source.suffix().toLower();
     const QString stem = source.completeBaseName() + (trimmed ? "-trimmed" : "") + (m_removeAudio ? "-silent" : "");
     QDir outputDirectory = source.dir();
-    if (source.canonicalFilePath() == QFileInfo(m_samplePath).canonicalFilePath()) {
+    const QString exportDirectory = qEnvironmentVariable("FRAMECUT_EXPORT_DIR");
+    if (!exportDirectory.isEmpty()) {
+        outputDirectory = QDir(exportDirectory);
+    } else if (source.canonicalFilePath() == QFileInfo(m_samplePath).canonicalFilePath()) {
         QString destination = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
         if (!QDir(destination).exists()) destination = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
         if (!QDir(destination).exists()) destination = QDir::homePath();
@@ -273,6 +283,8 @@ void MediaController::exportVideo() {
     emit busyChanged(true, trimmed ? tr("Exporting trimmed video…") : tr("Exporting silent video…"));
     emit progressChanged(0);
     auto *watcher = new QFutureWatcher<ExportResult>(this);
+    connect(watcher, &QFutureWatcher<ExportResult>::progressValueChanged,
+            this, [this](int value) { emit progressChanged(value / 100.0); });
     connect(watcher, &QFutureWatcher<ExportResult>::finished, this, [this, watcher] {
         const ExportResult result = watcher->result();
         watcher->deleteLater();
@@ -285,15 +297,13 @@ void MediaController::exportVideo() {
         m_lastExport = result.outputPath;
         emit exportCompleted(result.outputPath, result.size);
     });
-    QPointer<MediaController> guard(this);
     const auto engine = m_engine;
     const auto cancel = m_cancel;
-    watcher->setFuture(QtConcurrent::run([engine, media, output, options, cancel, guard] {
-        return engine->exportVideo(media, output, options, cancel, [guard](double percent) {
-            if (guard) QMetaObject::invokeMethod(guard, [guard, percent] {
-                if (guard) emit guard->progressChanged(percent);
-            }, Qt::QueuedConnection);
-        });
+    watcher->setFuture(QtConcurrent::run([engine, media, output, options, cancel](QPromise<ExportResult> &promise) {
+        promise.setProgressRange(0, 10000);
+        promise.addResult(engine->exportVideo(media, output, options, cancel, [&promise](double percent) {
+            if (std::isfinite(percent)) promise.setProgressValue(qRound(qBound(0.0, percent, 100.0) * 100));
+        }));
     }));
 }
 
