@@ -12,6 +12,7 @@
 #include <QVideoFrameFormat>
 #include <algorithm>
 extern "C" {
+#include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/imgutils.h>
@@ -126,6 +127,7 @@ PreviewWidget::PreviewWidget(QWidget *parent) : QWidget(parent), m_importButton(
 PreviewWidget::~PreviewWidget() {
     if (m_scaler)
         sws_freeContext(m_scaler);
+    av_frame_free(&m_conversionFrame);
 }
 void PreviewWidget::clearFrame() {
     m_image = {};
@@ -215,13 +217,29 @@ void PreviewWidget::setFrame(const QVideoFrame &input) {
                                              frame.surfaceFormat().colorRange() ==
                                                  QVideoFrameFormat::ColorRange_Full,
                                              coefficients, 1, 0, 1 << 16, 1 << 16);
-                    next = QImage(frame.size(), QImage::Format_RGBA8888);
-                    if (!next.isNull()) {
-                        uint8_t *destination[4] = {next.bits(), nullptr, nullptr, nullptr};
-                        int destinationStrides[4] = {int(next.bytesPerLine()), 0, 0, 0};
-                        if (sws_scale(m_scaler, source, strides, 0, frame.height(), destination,
-                                      destinationStrides) != frame.height())
-                            next = {};
+                    if (!m_conversionFrame)
+                        m_conversionFrame = av_frame_alloc();
+                    if (m_conversionFrame) {
+                        if (!m_conversionFrame->data[0] || m_conversionFrame->width != frame.width() ||
+                            m_conversionFrame->height != frame.height()) {
+                            av_frame_unref(m_conversionFrame);
+                            m_conversionFrame->format = AV_PIX_FMT_RGBA;
+                            m_conversionFrame->width = frame.width();
+                            m_conversionFrame->height = frame.height();
+                            // SIMD conversion needs FFmpeg's aligned strides and
+                            // allocation padding, which a tightly packed QImage lacks.
+                            if (av_frame_get_buffer(m_conversionFrame, 0) < 0)
+                                av_frame_unref(m_conversionFrame);
+                        }
+                        if (m_conversionFrame->data[0] &&
+                            sws_scale(m_scaler, source, strides, 0, frame.height(), m_conversionFrame->data,
+                                      m_conversionFrame->linesize) == frame.height()) {
+                            // Own only the visible pixels; the conversion buffer is
+                            // reused on the next frame and may have a wider stride.
+                            next = QImage(static_cast<const uchar *>(m_conversionFrame->data[0]), frame.width(),
+                                          frame.height(), m_conversionFrame->linesize[0],
+                                          QImage::Format_RGBA8888).copy();
+                        }
                     }
                 }
             }
