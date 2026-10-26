@@ -5,6 +5,7 @@
 #include <QWidget>
 
 class QPushButton;
+struct AVFrame;
 struct SwsContext;
 
 class PreviewWidget final : public QWidget {
@@ -36,6 +37,7 @@ class PreviewWidget final : public QWidget {
     void positionImportButton();
     QImage m_image;
     SwsContext *m_scaler = nullptr;
+    AVFrame *m_conversionFrame = nullptr;
     QPushButton *m_importButton;
     bool m_empty = true, m_removed = true, m_unavailable = false;
 };

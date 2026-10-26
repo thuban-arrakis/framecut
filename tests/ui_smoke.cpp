@@ -199,7 +199,7 @@ private slots:
         QCOMPARE(changes.count(), 1);
     }
 
-    void softwarePreviewHandlesOddFrameSizes_data() {
+    void softwarePreviewHandlesFrameSizes_data() {
         QTest::addColumn<int>("pixelFormat");
         QTest::addColumn<QSize>("frameSize");
         QTest::newRow("packed-rgb") << int(QVideoFrameFormat::Format_RGBX8888) << QSize(9, 7);
@@ -208,9 +208,17 @@ private slots:
         QTest::newRow("planar-yuv") << int(QVideoFrameFormat::Format_YUV420P) << QSize(9, 8);
         QTest::newRow("swapped-chroma") << int(QVideoFrameFormat::Format_YV12) << QSize(9, 8);
         QTest::newRow("interleaved-chroma") << int(QVideoFrameFormat::Format_NV12) << QSize(9, 8);
+        // 216x480 was the portrait preview size associated with heap corruption.
+        // Cover widths on both sides of it and the landscape preview limit too.
+        for (int width : {214, 216, 218, 854}) {
+            QTest::newRow(qPrintable(QString("planar-%1x480").arg(width)))
+                << int(QVideoFrameFormat::Format_YUV420P) << QSize(width, 480);
+            QTest::newRow(qPrintable(QString("nv12-%1x480").arg(width)))
+                << int(QVideoFrameFormat::Format_NV12) << QSize(width, 480);
+        }
     }
 
-    void softwarePreviewHandlesOddFrameSizes() {
+    void softwarePreviewHandlesFrameSizes() {
         QFETCH(int, pixelFormat);
         QFETCH(QSize, frameSize);
         QVideoFrameFormat format(frameSize, QVideoFrameFormat::PixelFormat(pixelFormat));
@@ -240,6 +248,46 @@ private slots:
         QVERIFY(std::abs(lastPixel.green() - 128) <= 2);
         QVERIFY(std::abs(lastPixel.blue() - 128) <= 2);
         QCOMPARE(lastPixel.alpha(), 255);
+    }
+
+    void softwarePreviewOwnsConvertedPixels() {
+        PreviewWidget preview;
+        QSignalSpy presented(&preview, &PreviewWidget::framePresented);
+        QList<QImage> retained;
+        const QList<QSize> sizes = {{216, 480}, {216, 480}, {218, 482}, {216, 480}};
+        for (int index = 0; index < sizes.size(); ++index) {
+            QVideoFrameFormat format(sizes[index], QVideoFrameFormat::Format_YUV420P);
+            format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+            QVideoFrame frame(format);
+            QVERIFY(frame.map(QVideoFrame::WriteOnly));
+            for (int plane = 0; plane < frame.planeCount(); ++plane)
+                std::memset(frame.bits(plane), 128, size_t(frame.mappedBytes(plane)));
+            // Alternating rows expose an incorrect copy stride. Each frame has
+            // different pixels so reuse must not modify images already returned.
+            for (int y = 0; y < frame.height(); ++y)
+                std::memset(frame.bits(0) + y * frame.bytesPerLine(0),
+                            32 + index * 48 + (y % 2) * 16, size_t(frame.width()));
+            frame.unmap();
+            preview.setFrame(frame);
+            QCOMPARE(presented.count(), index + 1);
+            retained.append(preview.currentImage());
+            QCOMPARE(retained.last().size(), sizes[index]);
+            preview.clearFrame();
+            QVERIFY(preview.currentImage().isNull());
+            for (int previous = 0; previous <= index; ++previous) {
+                const QImage &image = retained[previous];
+                for (int y = 0; y < image.height(); ++y) {
+                    const int expected = 32 + previous * 48 + (y % 2) * 16;
+                    for (int x : {0, image.width() - 1}) {
+                        const QColor pixel = image.pixelColor(x, y);
+                        QVERIFY(std::abs(pixel.red() - expected) <= 2);
+                        QVERIFY(std::abs(pixel.green() - expected) <= 2);
+                        QVERIFY(std::abs(pixel.blue() - expected) <= 2);
+                        QCOMPARE(pixel.alpha(), 255);
+                    }
+                }
+            }
+        }
     }
 
     void exportThroughSaveDialog() {
