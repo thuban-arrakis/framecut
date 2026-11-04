@@ -1,6 +1,6 @@
 # Validation record
 
-Validated on 24 October 2026 for Framecut 0.3.0.
+Historical 0.3.0 checks below were run on 24 October 2026. The 0.3.1 Debian validation is recorded separately.
 
 ## macOS
 
@@ -45,7 +45,7 @@ The package successfully upgraded 0.2.0 in the isolated Debian container. The in
 
 ## Post-0.3.0 robustness review
 
-On 24 October 2026, the local macOS review build passed three CTest suites: media engine (20 QtTest entries), controller lifecycle (5), and UI smoke (17), with no failures or skips. The same suites passed a separate Debug build with AddressSanitizer and UndefinedBehaviorSanitizer; leak detection was disabled. These counts include QtTest setup and cleanup entries. This revision has not yet been rebuilt or tested on Debian.
+On 24 October 2026, the local macOS review build passed three CTest suites: media engine (20 QtTest entries), controller lifecycle (5), and UI smoke (17), with no failures or skips. The same suites passed a separate Debug build with AddressSanitizer and UndefinedBehaviorSanitizer; leak detection was disabled. These counts include QtTest setup and cleanup entries. That review did not include a Debian rebuild; the later 0.3.1 entry below records the Debian run.
 
 New regression checks cover single-frame imports, previews whose source audio outlasts the video, same-size source rewrites with restored modification times, controller destruction during active inspection, progress delivery on the GUI thread, and destroyed dialog parents. UI checks cover retaining library items when switching clips, limited playhead repaint regions, interrupted trim drags, and complete pixel conversion at odd widths. The odd-width planar YUV check exposed an uninitialized final column, which is now corrected without changing the conversion path for even-width previews.
 
@@ -55,8 +55,47 @@ Builds, test homes, caches, and the interactive review app were kept under `/tmp
 
 Local test logs are saved under `qa/macos-review/`, outside the tracked source files.
 
+## 0.3.1 VFR trim/export fix — 4 November 2026
+
+| Component | Tested version/configuration |
+| --- | --- |
+| Operating system | Debian 13 (trixie) |
+| CPU architecture | amd64 |
+| Compiler | GCC 14.2.0 |
+| Qt | 6.8.2 |
+| FFmpeg / ffprobe | 7.1.5-0+deb13u1 |
+| Build isolation | Existing distribution-matched container, no network, two CPUs, 4 GiB memory limit |
+
+All three CTest suites passed: media engine (31 QtTest entries), controller
+lifecycle (5), and UI smoke (26), with zero failures or skips. Counts include
+setup and cleanup. The serial suite run took 33.53 seconds; Qt used its offscreen
+platform and software media settings.
+
+Generated VFR fixtures cover fractional starts and ends, an end inside the final
+frame hold, a 43 ms final hold, retained and removed audio, nonzero container
+origins, video delayed relative to audio, missing stream timing, and Matroska's
+millisecond clock. Fault injection confirms that otherwise decodable outputs
+with a missing interior frame or a shortened final hold are rejected without
+publishing an output. Existing CFR, rotation, cancellation, overwrite, original
+file integrity, auxiliary-stream and UI export checks remain passing.
+
+The reported recording was verified on its original host using a small harness
+linked to the same built media library. Its selected range exported all 361
+frames with identical relative timestamps, a 6.074933-second presentation end,
+and the original 43 ms final hold. A cut inside that hold ended at 6.048 seconds
+with a 16.066667 ms hold. Both outputs decoded fully; the original hash remained
+unchanged. Private media stayed on the host and temporary exports were removed;
+only synthetic fixtures are included in this repository.
+
+The build also includes the already deployed preview-buffer padding and Linux
+icon-installation fixes. The resulting package is `framecut_0.3.1_amd64.deb`
+(3,663,856 bytes), SHA-256
+`f0b8a960d4a84419fa1b0c930d1ef893f1b6548e55d25e569867d630a0c4cf0c`.
+The tested executable SHA-256 is
+`f70862b284de586253139751ae332987a757ab1c598e3478cb3c42bfeb819002`.
+
 ## Scope of validation
 
-Offscreen and Xvfb tests verify application behavior without a GPU-backed window; they do not establish performance or audio output in the fleet's desktop environment. The fleet's release remains unknown. The final pilot must use the actual Debian release, architecture, desktop environment, system configuration, and representative videos. Debian 13 and amd64 were not tested in this run.
+Offscreen and Xvfb tests verify application behavior without a GPU-backed window; they do not establish interaction performance or audio output in every desktop session. The 0.3.1 Debian 13 amd64 checks below establish compatibility with that host's runtime. Manual display, input-latency, scaling and audio acceptance remains specific to the desktop environment.
 
 The local macOS package is ad-hoc signed, not Developer ID signed or notarized. A clean second-Mac deployment and physical audio-device reconnection are not covered by the automated tests.

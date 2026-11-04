@@ -1,8 +1,10 @@
 #include "mediaengine.h"
 #include <QCoreApplication>
+#include <QCryptographicHash>
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <limits>
 #include <utility>
 #ifdef Q_OS_UNIX
 #include <sys/stat.h>
@@ -46,8 +49,12 @@ struct ProcessResult {
     QByteArray output;
 };
 
+enum class OutputAction { Continue, Complete, Invalid };
+
 ProcessResult run(const QString &binary, const QStringList &arguments, const CancelFlag &cancel,
-                  int timeoutMs = 0, double duration = 0, const ProgressCallback &progress = {})
+                  int timeoutMs = 0, double duration = 0, const ProgressCallback &progress = {},
+                  const std::function<OutputAction(const QByteArray &)> &consumeOutput = {},
+                  bool idleTimeout = false)
 {
     if (isCancelled(cancel)) return {false, true, QCoreApplication::translate("MediaEngine", "Operation cancelled."), {}};
     QProcess process;
@@ -64,11 +71,17 @@ ProcessResult run(const QString &binary, const QStringList &arguments, const Can
     QByteArray pendingLines;
     double seconds = 0;
     bool overflow = false;
+    bool complete = false;
     auto read = [&] {
         diagnostic += process.readAllStandardError();
         diagnostic = diagnostic.right(8192);
         const QByteArray chunk = process.readAllStandardOutput();
-        if (duration > 0) {
+        if (idleTimeout && !chunk.isEmpty()) timer.restart();
+        if (consumeOutput) {
+            const auto action = consumeOutput(chunk);
+            overflow |= action == OutputAction::Invalid;
+            complete |= action == OutputAction::Complete;
+        } else if (duration > 0) {
             pendingLines += chunk;
             qsizetype newline;
             while ((newline = pendingLines.indexOf('\n')) >= 0) {
@@ -101,6 +114,10 @@ ProcessResult run(const QString &binary, const QStringList &arguments, const Can
         if (isCancelled(cancel)) {
             stop();
             return {false, true, QCoreApplication::translate("MediaEngine", "Operation cancelled."), {}};
+        }
+        if (complete) {
+            stop();
+            return {true, false, {}, output};
         }
         if (timeoutMs > 0 && timer.elapsed() > timeoutMs) {
             stop();
@@ -180,6 +197,123 @@ double streamDuration(const QJsonObject &stream)
     static const QRegularExpression expression(QStringLiteral("^(\\d+):(\\d+):(\\d+(?:\\.\\d+)?)$"));
     const auto match = expression.match(text);
     return match.hasMatch() ? match.captured(1).toDouble() * 3600 + match.captured(2).toDouble() * 60 + match.captured(3).toDouble() : 0;
+}
+
+struct TimeBase {
+    qint64 numerator = 0;
+    qint64 denominator = 0;
+};
+
+TimeBase timeBase(const QJsonObject &stream)
+{
+    const auto parts = stream.value(QStringLiteral("time_base")).toString().split('/');
+    if (parts.size() != 2) return {};
+    bool validNumerator = false, validDenominator = false;
+    const qint64 numerator = parts.first().toLongLong(&validNumerator);
+    const qint64 denominator = parts.last().toLongLong(&validDenominator);
+    if (!validNumerator || !validDenominator || numerator <= 0 || denominator <= 0
+        || numerator > std::numeric_limits<int>::max() || denominator > std::numeric_limits<int>::max()) return {};
+    return {numerator, denominator};
+}
+
+bool exactInteger(const QJsonValue &value, qint64 &result)
+{
+    bool valid = false;
+    result = value.toVariant().toLongLong(&valid);
+    // FFmpeg expressions use doubles. Keep all timestamps exactly representable
+    // there, as well as in ffprobe's JSON numbers.
+    return valid && std::abs(static_cast<long double>(result)) <= (qint64(1) << 52);
+}
+
+struct FrameTimeline {
+    bool ok = false;
+    bool cancelled = false;
+    QString error;
+    qint64 count = 0;
+    qint64 first = 0;
+    qint64 last = 0;
+    qint64 firstSourceFrame = 0;
+    qint64 lastSourceFrame = 0;
+    qint64 lastSourceDuration = 0;
+    QByteArray digest;
+};
+
+FrameTimeline frameTimeline(const QString &binary, const QString &path, int streamIndex,
+                            const CancelFlag &cancel, const QString &demuxer, qint64 multiplier = 1,
+                            qint64 from = std::numeric_limits<qint64>::min(),
+                            qint64 until = std::numeric_limits<qint64>::max(),
+                            double seekSeconds = std::numeric_limits<double>::quiet_NaN())
+{
+    const qsizetype formatOption = localInput.indexOf(QStringLiteral("-format_whitelist"));
+    if (!localInput.at(formatOption + 1).split(',').contains(demuxer))
+        return {false, false, QCoreApplication::translate("MediaEngine", "The video metadata could not be read.")};
+    QStringList arguments{QStringLiteral("-v"), QStringLiteral("error")};
+    QStringList allowedInput = localInput;
+    // FFprobe 7.1's interval parser is disrupted by a comma-separated format
+    // whitelist. Restrict this probe to the already inspected input demuxer.
+    allowedInput[formatOption + 1] = demuxer;
+    arguments += allowedInput;
+    if (std::isfinite(seekSeconds))
+        arguments += {QStringLiteral("-read_intervals"), QString::number(seekSeconds, 'f', 6) + '%'};
+    arguments += {QStringLiteral("-threads"), QStringLiteral("2"),
+        QStringLiteral("-select_streams"), QString::number(streamIndex), QStringLiteral("-show_frames"),
+        QStringLiteral("-show_entries"), QStringLiteral("frame=best_effort_timestamp,duration,pkt_duration:frame_side_data="),
+        QStringLiteral("-of"), QStringLiteral("compact=p=0:nk=0"), QStringLiteral("-i"), path};
+    FrameTimeline timeline;
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    QByteArray pending;
+    bool malformed = false;
+    bool complete = false;
+    bool havePrevious = false;
+    qint64 previous = 0;
+    auto line = [&](const QByteArray &text) {
+        if (text.trimmed().isEmpty()) return true;
+        bool valid = false;
+        qint64 pts = 0, duration = 0;
+        for (const auto &field : text.trimmed().split('|')) {
+            if (field.startsWith("best_effort_timestamp=")) pts = field.mid(22).toLongLong(&valid);
+            else if (field.startsWith("duration=") || field.startsWith("pkt_duration=")) {
+                bool durationValid = false;
+                const qint64 number = field.mid(field.indexOf('=') + 1).toLongLong(&durationValid);
+                if (durationValid && number > 0) duration = number;
+            }
+        }
+        if (!valid || (pts >= from && pts < until && havePrevious && pts <= previous)
+            || std::abs(static_cast<long double>(pts) * multiplier) > (qint64(1) << 51)) return false;
+        if (!havePrevious) timeline.firstSourceFrame = pts * multiplier;
+        havePrevious = true;
+        previous = pts;
+        timeline.lastSourceFrame = pts * multiplier;
+        timeline.lastSourceDuration = duration > 0 && duration <= (qint64(1) << 51) / multiplier ? duration * multiplier : 0;
+        if (pts >= until) { complete = true; return true; }
+        if (pts < from || pts >= until) return true;
+        const qint64 scaled = pts * multiplier;
+        if (timeline.count == 0) timeline.first = scaled;
+        timeline.last = scaled;
+        ++timeline.count;
+        // Integer timestamps in a common timebase avoid floating-point hashes,
+        // and streaming the digest keeps memory independent of video length.
+        hash.addData(QByteArray::number(scaled - timeline.first) + '\n');
+        return true;
+    };
+    // A long selected clip may take minutes to decode on a shared CPU. Bound
+    // stalled inspection, rather than rejecting a healthy stream after 45s.
+    const auto inspected = run(binary, arguments, cancel, 45000, 0, {}, [&](const QByteArray &chunk) {
+        pending += chunk;
+        qsizetype newline;
+        while ((newline = pending.indexOf('\n')) >= 0) {
+            if (!line(pending.left(newline))) { malformed = true; return OutputAction::Invalid; }
+            pending.remove(0, newline + 1);
+            if (complete) { pending.clear(); return OutputAction::Complete; }
+        }
+        return pending.size() <= 65536 ? OutputAction::Continue : OutputAction::Invalid;
+    }, true);
+    if (!inspected.ok) return {false, inspected.cancelled, inspected.error};
+    if ((!pending.isEmpty() && !line(pending)) || malformed || timeline.count == 0)
+        return {false, false, QCoreApplication::translate("MediaEngine", "The video metadata could not be read.")};
+    timeline.ok = true;
+    timeline.digest = hash.result();
+    return timeline;
 }
 
 QString fileFingerprint(const QString &path)
@@ -453,6 +587,66 @@ ExportResult MediaEngine::exportVideo(const MediaInfo &media, const QString &out
     if (!originalProbe.ok) return {false, originalProbe.cancelled, originalProbe.error, {}, 0};
     if (!trimmed && format != sourceFormat(originalProbe.data, media.path))
         return {false, false, QCoreApplication::translate("MediaEngine", "Keep the original video container when removing audio so all other tracks can be preserved."), {}, 0};
+    TimeBase sourceTimeBase;
+    FrameTimeline expectedTimeline;
+    qint64 offsetTicks = 0;
+    qint64 expectedEndTicks = 0;
+    if (trimmed) {
+        QJsonObject originalVideo;
+        for (const auto &value : originalProbe.data.value(QStringLiteral("streams")).toArray()) {
+            if (value.toObject().value(QStringLiteral("index")).toInt(-1) == media.videoStreamIndex)
+                originalVideo = value.toObject();
+        }
+        sourceTimeBase = timeBase(originalVideo);
+        const double inputStart = originalProbe.data.value(QStringLiteral("format")).toObject()
+            .value(QStringLiteral("start_time")).toVariant().toDouble();
+        const long double limit = qint64(1) << 51;
+        if (sourceTimeBase.numerator == 0 || !std::isfinite(inputStart)
+            || std::abs(static_cast<long double>(inputStart) * 1000000) > limit
+            || static_cast<long double>(start) * 1000000 > limit
+            || static_cast<long double>(duration) * sourceTimeBase.denominator > limit
+            || std::abs(static_cast<long double>(inputStart + start) * sourceTimeBase.denominator) > limit)
+            return {false, false, QCoreApplication::translate("MediaEngine", "The video metadata could not be read."), {}, 0};
+        // -ss/-t use microseconds; the decoder then rounds the seek origin into
+        // the source timebase. Use that same boundary, without average FPS.
+        const qint64 seekMicroseconds = std::llround(inputStart * 1000000) + std::llround(start * 1000000);
+        const qint64 durationMicroseconds = std::llround(duration * 1000000);
+        const long double denominator = static_cast<long double>(sourceTimeBase.numerator) * 1000000;
+        offsetTicks = std::llround(seekMicroseconds * static_cast<long double>(sourceTimeBase.denominator) / denominator);
+        const qint64 selectedTicks = std::ceil(durationMicroseconds * static_cast<long double>(sourceTimeBase.denominator) / denominator);
+        const QString demuxer = originalProbe.data.value(QStringLiteral("format")).toObject()
+            .value(QStringLiteral("format_name")).toString().section(',', 0, 0);
+        expectedTimeline = frameTimeline(m_ffprobePath, media.path, media.videoStreamIndex, cancel,
+            demuxer, sourceTimeBase.numerator, offsetTicks, offsetTicks + selectedTicks, inputStart + start);
+        if (!expectedTimeline.ok) return {false, expectedTimeline.cancelled, expectedTimeline.error, {}, 0};
+        offsetTicks *= sourceTimeBase.numerator; // Common output timebase: 1 / denominator.
+        expectedEndTicks = std::llround(durationMicroseconds * static_cast<long double>(sourceTimeBase.denominator) / 1000000);
+        // Do not extend a video to an unrelated, longer audio/container duration.
+        // At EOF require a video endpoint from its stream or final decoded frame.
+        qint64 sourceStart = 0, sourceDuration = 0;
+        bool knownSourceStart = exactInteger(originalVideo.value(QStringLiteral("start_pts")), sourceStart);
+        if (!knownSourceStart && originalVideo.contains(QStringLiteral("start_time"))) {
+            bool valid = false;
+            const double seconds = originalVideo.value(QStringLiteral("start_time")).toVariant().toDouble(&valid);
+            if (valid && std::isfinite(seconds) && std::abs(static_cast<long double>(seconds) * sourceTimeBase.denominator) <= limit) {
+                sourceStart = std::llround(seconds * sourceTimeBase.denominator / sourceTimeBase.numerator);
+                knownSourceStart = true;
+            }
+        }
+        long double sourceEnd = 0;
+        if (knownSourceStart && exactInteger(originalVideo.value(QStringLiteral("duration_ts")), sourceDuration) && sourceDuration > 0)
+            sourceEnd = (static_cast<long double>(sourceStart) + sourceDuration) * sourceTimeBase.numerator;
+        else if (knownSourceStart && streamDuration(originalVideo) > 0)
+            sourceEnd = static_cast<long double>(sourceStart) * sourceTimeBase.numerator
+                + streamDuration(originalVideo) * sourceTimeBase.denominator;
+        else if (expectedTimeline.lastSourceDuration > 0)
+            sourceEnd = static_cast<long double>(expectedTimeline.lastSourceFrame) + expectedTimeline.lastSourceDuration;
+        else if (expectedTimeline.lastSourceFrame >= offsetTicks + expectedEndTicks)
+            sourceEnd = offsetTicks + expectedEndTicks;
+        if (sourceEnd <= expectedTimeline.last || sourceEnd > limit)
+            return {false, false, QCoreApplication::translate("MediaEngine", "The video metadata could not be read."), {}, 0};
+        expectedEndTicks = std::min(expectedEndTicks, qint64(std::llround(sourceEnd)) - offsetTicks);
+    }
     QTemporaryDir directory(QDir(parent.canonicalFilePath()).filePath(QStringLiteral(".framecut-export-XXXXXX")));
     if (!directory.isValid()) return {false, false, QCoreApplication::translate("MediaEngine", "The destination folder cannot be written to."), {}, 0};
     const QString staging = directory.filePath(QStringLiteral("video.%1").arg(output.suffix()));
@@ -474,7 +668,15 @@ ExportResult MediaEngine::exportVideo(const MediaInfo &media, const QString &out
             QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-crf"), QStringLiteral("18"),
             QStringLiteral("-preset"), QStringLiteral("fast"), QStringLiteral("-threads"), QStringLiteral("2"),
             QStringLiteral("-pix_fmt"), media.width % 2 == 0 && media.height % 2 == 0 ? QStringLiteral("yuv420p") : QStringLiteral("yuv444p"),
-            QStringLiteral("-fps_mode"), QStringLiteral("vfr"),
+            // Preserve the source clock and VFR spacing. With no reordered
+            // B-frames, packet order is presentation order and setts can retain
+            // every hold, including the final frame's otherwise lost duration.
+            QStringLiteral("-enc_time_base:v"), QStringLiteral("%1/%2").arg(sourceTimeBase.numerator).arg(sourceTimeBase.denominator),
+            QStringLiteral("-fps_mode"), QStringLiteral("passthrough"), QStringLiteral("-bf"), QStringLiteral("0"),
+            QStringLiteral("-bsf:v"), QStringLiteral("setts=pts=PTS:dts=DTS:duration='if(eq(NEXT_PTS,NOPTS),%1/%2/TB-PTS,NEXT_PTS-PTS)'")
+                .arg(expectedEndTicks).arg(sourceTimeBase.denominator),
+            QStringLiteral("-video_track_timescale"), QString::number(sourceTimeBase.denominator),
+            QStringLiteral("-movie_timescale"), QStringLiteral("1000000"),
             QStringLiteral("-c:a"), QStringLiteral("aac"), QStringLiteral("-b:a"), QStringLiteral("192k"),
             QStringLiteral("-map_metadata"), QStringLiteral("-1"), QStringLiteral("-map_chapters"), QStringLiteral("-1")};
     } else {
@@ -503,6 +705,9 @@ ExportResult MediaEngine::exportVideo(const MediaInfo &media, const QString &out
     }
     const double actualDuration = streamDuration(video);
     bool invalid = video.isEmpty();
+    FrameTimeline actualTimeline;
+    QString timingReason = QStringLiteral("stream_contract");
+    qint64 actualEndTicks = 0;
     if (trimmed) {
         bool expectedAudio = !options.removeAudio && media.audioTracks > 0;
         if (expectedAudio) {
@@ -520,12 +725,33 @@ ExportResult MediaEngine::exportVideo(const MediaInfo &media, const QString &out
                 break;
             }
         }
-        const double frameTolerance = std::max(0.002, 1.01 / std::max(media.fps, 1.0));
         invalid |= hasAudio != expectedAudio || streams.size() != (expectedAudio ? 2 : 1)
             || video.value(QStringLiteral("codec_name")).toString() != QStringLiteral("h264")
             || video.value(QStringLiteral("width")).toInt() != media.width
-            || video.value(QStringLiteral("height")).toInt() != media.height
-            || actualDuration <= 0 || std::abs(duration - actualDuration) > frameTolerance;
+            || video.value(QStringLiteral("height")).toInt() != media.height;
+        if (!video.isEmpty()) {
+            actualTimeline = frameTimeline(m_ffprobePath, staging, video.value(QStringLiteral("index")).toInt(-1), cancel, QStringLiteral("mov"));
+            if (!actualTimeline.ok) return {false, actualTimeline.cancelled, actualTimeline.error, {}, 0};
+            const auto outputTimeBase = timeBase(video);
+            qint64 actualStartTicks = 0, actualDurationTicks = 0;
+            const bool validTiming = outputTimeBase.numerator == 1 && outputTimeBase.denominator == sourceTimeBase.denominator
+                && exactInteger(video.value(QStringLiteral("start_pts")), actualStartTicks)
+                && exactInteger(video.value(QStringLiteral("duration_ts")), actualDurationTicks) && actualDurationTicks > 0;
+            actualEndTicks = actualStartTicks + actualDurationTicks;
+            // MP4 edit lists can offset the first frame from zero. duration is
+            // the media span, so its presentation endpoint is start + duration.
+            // One source tick plus one movie-clock tick bounds rescaling only.
+            const qint64 tolerance = sourceTimeBase.numerator + (sourceTimeBase.denominator + 999999) / 1000000;
+            if (!validTiming) { invalid = true; timingReason = QStringLiteral("timebase"); }
+            else if (actualTimeline.count != expectedTimeline.count) { invalid = true; timingReason = QStringLiteral("frame_count"); }
+            else if (actualTimeline.digest != expectedTimeline.digest) { invalid = true; timingReason = QStringLiteral("frame_timestamps"); }
+            else if (std::abs(actualTimeline.first - (expectedTimeline.first - offsetTicks)) > tolerance
+                     || std::abs(actualStartTicks - actualTimeline.first) > tolerance) {
+                invalid = true; timingReason = QStringLiteral("first_frame");
+            } else if (std::abs(actualEndTicks - expectedEndTicks) > tolerance) {
+                invalid = true; timingReason = QStringLiteral("presentation_end");
+            }
+        }
         // Transcoding applies the display rotation to pixels. It must not leave
         // a second rotation behind for players to apply again.
         for (const auto &sideData : video.value(QStringLiteral("side_data_list")).toArray())
@@ -540,8 +766,15 @@ ExportResult MediaEngine::exportVideo(const MediaInfo &media, const QString &out
             || video.value(QStringLiteral("width")).toInt() != media.codedWidth
             || video.value(QStringLiteral("height")).toInt() != media.codedHeight || durationMismatch;
     }
-    if (invalid)
+    if (invalid) {
+        qWarning().noquote() << QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)
+            << "framecut_export_verification_failed"
+            << "reason=" + timingReason << "expected_frames=" + QString::number(expectedTimeline.count)
+            << "actual_frames=" + QString::number(actualTimeline.count)
+            << "expected_end_ticks=" + QString::number(expectedEndTicks)
+            << "actual_end_ticks=" + QString::number(actualEndTicks);
         return {false, false, QCoreApplication::translate("MediaEngine", "The exported video did not pass verification. No output file was saved."), {}, 0};
+    }
     const QString modified = unchanged(media);
     if (!modified.isEmpty()) return {false, false, modified, {}, 0};
     if (isCancelled(cancel)) return {false, true, QCoreApplication::translate("MediaEngine", "Operation cancelled."), {}, 0};
