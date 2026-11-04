@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Framecut VERSION 0.3.0 LANGUAGES CXX)
+project(Framecut VERSION 0.3.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,7 +55,9 @@ endif()
 install(TARGETS Framecut BUNDLE DESTINATION . RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(UNIX AND NOT APPLE)
   install(FILES packaging/framecut.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
-  install(FILES assets/icon.png DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/1024x1024/apps RENAME framecut.png)
+  # Use directories declared by the standard hicolor theme and a raster fallback.
+  install(FILES assets/icon.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps RENAME framecut.svg)
+  install(FILES assets/icon.png DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps RENAME framecut.png)
   install(FILES docs/third-party-notices.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
   install(FILES docs/licenses/qt-translations-BSD-3-Clause.txt DESTINATION ${CMAKE_INSTALL_DOCDIR}/licenses)
 endif()

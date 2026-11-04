@@ -14,7 +14,7 @@ inline void configureSoftwareMedia() {
 inline void configureApplication(QApplication &app) {
     app.setApplicationName("Framecut");
     app.setApplicationDisplayName("Framecut");
-    app.setApplicationVersion("0.3.0");
+    app.setApplicationVersion("0.3.1");
     app.setOrganizationName("Framecut");
     app.setOrganizationDomain("framecut.local");
     app.setWindowIcon(QIcon(":/assets/icon.png"));

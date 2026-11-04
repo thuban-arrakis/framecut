@@ -20,9 +20,29 @@ The preview can use a lower-resolution and lower-frame-rate copy to keep playbac
 | Trimmed range, remove audio | H.264 MP4 at the source's displayed dimensions | No audio; extra tracks, subtitles, attachments, and chapters excluded |
 | Trimmed range, keep audio | H.264 MP4 at the source's displayed dimensions | First audio track encoded as AAC; other auxiliary streams excluded |
 
-Trim export uses CPU `libx264`, CRF 18, the `fast` preset, and two encoding threads. Retained audio uses AAC at 192 kbit/s. Display rotation is applied to the pixels. Normal even-sized frames use 8-bit 4:2:0; odd-sized frames use 4:4:4 to preserve dimensions. This is high-quality encoding, not a lossless trim or preservation of the original codec/HDR format. Test representative HDR, unusual color formats, and variable-frame-rate sources before production use.
+Trim export uses CPU `libx264`, CRF 18, the `fast` preset, and two encoding threads. Retained audio uses AAC at 192 kbit/s. Display rotation is applied to the pixels. Normal even-sized frames use 8-bit 4:2:0; odd-sized frames use 4:4:4 to preserve dimensions. This is high-quality encoding, not a lossless trim or preservation of the original codec/HDR format. Test representative HDR and unusual color formats before production use.
 
 FFmpeg seeks to the input range with accurate seeking enabled and re-encodes the selected frames. Its documentation explains that stream copying can retain material before the requested time because seeking first lands at a nearby seek point; transcoding discards that earlier material. This is why Framecut uses re-encoding for precise cuts. [FFmpeg seeking documentation](https://www.ffmpeg.org/ffmpeg.html)
+
+From 0.3.1, trimmed exports preserve variable frame timing, including the last
+frame's display duration. A source frame is selected when its presentation time
+is at or after the start and before the end. A cut between frames can therefore
+leave a short initial offset; it does not select an earlier frame. The final
+selected frame is held only through the selected endpoint, capped at the source
+video's end.
+
+The encoder uses the source timebase and passes timestamps through without
+forcing a constant frame rate. B-frame reordering is disabled so packet durations
+can follow successive presentation timestamps; this can make trimmed files
+larger than equivalent encodes with B-frames. MP4 presentation timing, selected
+frame count and relative timestamps are checked before publishing the result.
+The verifier does not infer allowed timing error from average frame rate. A
+missing frame or shortened final hold remains an export failure.
+
+Verification failures emit an application-specific diagnostic with a UTC
+timestamp and bounded timing/count fields to standard error. The diagnostic
+contains no filenames, paths, video contents or raw FFmpeg output. Desktop
+launches normally send standard error to the desktop session log.
 
 Exports are written to temporary staging files and inspected before the completed file appears at the destination. Original files and existing destinations are protected. Cancellation discards incomplete staging output. Trim export takes CPU time proportional to the selected footage and can be substantially slower than full-length audio removal.
 

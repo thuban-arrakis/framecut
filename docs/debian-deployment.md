@@ -4,7 +4,7 @@ Framecut targets CPU-only desktop operation: Qt Widgets and a software-painted p
 
 Import can prepare the full preview before playback is available. Long or high-resolution videos can therefore take time to import; preview generation does not modify the source or limit export resolution. Trimmed exports are new high-quality MP4 files, with the first audio track encoded as AAC when sound is retained. See [trim/export behavior](trimming.md).
 
-See the [validation record](validation.md) for the tested Debian builds, media/UI suites, and X11/Xvfb runs. The exact fleet distribution and desktop configuration still need to be confirmed; the actual fleet image and Debian 13 have not been validated.
+See the [validation record](validation.md) for the tested Debian builds, media/UI suites, and X11/Xvfb runs. Framecut 0.3.1 has been built and tested on Debian 13 amd64 with Qt 6.8.2 and FFmpeg 7.1.5; see the dated validation entry for completed checks and remaining desktop acceptance limits.
 
 ## Build per distribution and architecture
 
@@ -15,6 +15,18 @@ sudo apt update
 sudo apt install build-essential cmake ninja-build pkg-config dpkg-dev \
   qt6-base-dev qt6-multimedia-dev libavutil-dev libswscale-dev ffmpeg
 scripts/package-debian.sh
+```
+
+On a shared server, use an existing isolated builder with no network access, a
+read-only source mount, and a separate build directory. Limit CPU and memory at
+the container boundary, and limit build/test concurrency explicitly:
+
+```sh
+cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=ON
+cmake --build /build --parallel 2
+QT_QPA_PLATFORM=offscreen ctest --test-dir /build --parallel 1 --output-on-failure
+cpack --config /build/CPackConfig.cmake -G DEB -B /build/release
 ```
 
 The script runs CMake, builds, executes the tests with Qt's offscreen platform, and invokes CPack. It writes the `.deb` under `release/`. The package uses system Qt and FFmpeg. CPack's `dpkg-shlibdeps` integration derives linked-library requirements from the actual build; the `ffmpeg` executable dependency is explicit. See the [CPack DEB documentation](https://cmake.org/cmake/help/latest/cpack_gen/deb.html#variable:CPACK_DEBIAN_PACKAGE_SHLIBDEPS).
@@ -28,9 +40,9 @@ Qt's FFmpeg media plugin is supplied by `libqt6multimedia6` in both [Debian 12](
 Inspect the generated control metadata and record its checksum:
 
 ```sh
-dpkg-deb --info release/framecut_0.3.0_amd64.deb
-sha256sum release/framecut_0.3.0_amd64.deb
-sudo apt install ./release/framecut_0.3.0_amd64.deb
+dpkg-deb --info release/framecut_0.3.1_amd64.deb
+sha256sum release/framecut_0.3.1_amd64.deb
+sudo apt install ./release/framecut_0.3.1_amd64.deb
 ```
 
 Use the actual filename for arm64 or a later version. Install with APT so runtime dependencies are resolved. Launch **Framecut** from the desktop menu or run `framecut` as the logged-in desktop user.
@@ -64,6 +76,6 @@ Keep a pilot package for every supported release/architecture combination. A suc
 
 ## Fleet distribution
 
-After the pilot passes, publish the immutable package using the organization's existing signed APT repository or software-distribution mechanism. Retain the previous package and release record for rollback. Advance through a small initial group before the whole fleet.
+After the pilot passes, publish the immutable package using the organization's existing signed APT repository or software-distribution mechanism. Retain the previous package and release record for rollback. Preserve any manually installed desktop or icon files that the older package does not own; restore those files if a downgrade removes them. Upgrading replaces the executable on disk but leaves running Framecut processes on their existing version. Users should close and reopen Framecut normally after saving their work. Advance through a small initial group before the whole fleet.
 
 Framecut includes no updater, remote administration endpoint, or cloud media service. Use the package manager to install, upgrade, and remove it. Build and packaging scripts do not connect to fleet hosts.

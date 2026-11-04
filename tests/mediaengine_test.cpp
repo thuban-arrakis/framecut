@@ -102,6 +102,39 @@ private:
             QStringLiteral("-fps_mode"), QStringLiteral("passthrough"), QStringLiteral("-f"), QStringLiteral("rawvideo"), QStringLiteral("-")});
         return result.ok ? result.output : QByteArray{};
     }
+    QJsonArray frameTimes(const QString &file) const
+    {
+        const auto result = command(ffprobe, {QStringLiteral("-v"), QStringLiteral("error"),
+            QStringLiteral("-select_streams"), QStringLiteral("v:0"), QStringLiteral("-show_frames"),
+            QStringLiteral("-show_entries"), QStringLiteral("frame=best_effort_timestamp,best_effort_timestamp_time:frame_side_data="),
+            QStringLiteral("-of"), QStringLiteral("json"), file});
+        return result.ok ? QJsonDocument::fromJson(result.output).object().value(QStringLiteral("frames")).toArray() : QJsonArray{};
+    }
+    double storedFinalHold(const QString &file) const
+    {
+        // Without ignoring edit lists, ffprobe clamps the final packet duration
+        // against a span which excludes the initial empty edit.
+        const auto result = command(ffprobe, {QStringLiteral("-v"), QStringLiteral("error"),
+            QStringLiteral("-ignore_editlist"), QStringLiteral("1"), QStringLiteral("-select_streams"), QStringLiteral("v:0"),
+            QStringLiteral("-show_packets"), QStringLiteral("-show_entries"), QStringLiteral("packet=duration_time"),
+            QStringLiteral("-of"), QStringLiteral("json"), file});
+        const auto packets = QJsonDocument::fromJson(result.output).object().value(QStringLiteral("packets")).toArray();
+        return result.ok && !packets.isEmpty() ? packets.last().toObject().value(QStringLiteral("duration_time")).toString().toDouble() : 0;
+    }
+    CommandResult createVariableRateVideo(const QString &file) const
+    {
+        return command(ffmpeg, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-nostdin"),
+            QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+            QStringLiteral("nullsrc=size=160x90:rate=60:duration=1.5,geq=lum='16+N*2':cb=128:cr=128"),
+            QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"), QStringLiteral("sine=frequency=660:duration=2"),
+            QStringLiteral("-vf"), QStringLiteral("settb=1/90000,setpts='N*1500+floor(N/13)*1500+mod(N,3)*7'"),
+            QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-crf"), QStringLiteral("0"),
+            QStringLiteral("-g"), QStringLiteral("240"), QStringLiteral("-bf"), QStringLiteral("0"),
+            QStringLiteral("-enc_time_base:v"), QStringLiteral("1/90000"), QStringLiteral("-fps_mode"), QStringLiteral("passthrough"),
+            QStringLiteral("-bsf:v"), QStringLiteral("setts=pts=PTS:dts=DTS:duration='if(eq(NEXT_PTS,NOPTS),3870,NEXT_PTS-PTS)'"),
+            QStringLiteral("-video_track_timescale"), QStringLiteral("90000"),
+            QStringLiteral("-c:a"), QStringLiteral("aac"), file});
+    }
     bool noStagingFiles() const
     {
         return QDir(directory.path()).entryList({QStringLiteral(".framecut-export-*")}, QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot).isEmpty();
@@ -279,6 +312,250 @@ private slots:
         QVERIFY2(result.ok, qPrintable(result.error));
         QCOMPARE(inspect(target).value(QStringLiteral("streams")).toArray().size(), 3);
         QCOMPARE(frameHashes(target), frameHashes(source));
+    }
+
+    void variableRateTrimPreservesFrameTimesAndFinalHold_data()
+    {
+        QTest::addColumn<double>("end");
+        QTest::addColumn<bool>("removeAudio");
+        QTest::newRow("fractional-start-to-eof") << -1.0 << true;
+        QTest::newRow("eof-with-audio") << -1.0 << false;
+        QTest::newRow("end-inside-final-hold") << 1.604137 << true;
+        QTest::newRow("fractional-middle-end-with-audio") << 1.227319 << false;
+    }
+
+    void variableRateTrimPreservesFrameTimesAndFinalHold()
+    {
+        QFETCH(double, end);
+        QFETCH(bool, removeAudio);
+        const QString original = path(QStringLiteral("vfr-%1.mp4").arg(QString::fromLatin1(QTest::currentDataTag())));
+        const auto created = createVariableRateVideo(original);
+        QVERIFY2(created.ok, created.error.constData());
+        const auto imported = engine->importMedia(original, flag());
+        QVERIFY2(imported.ok, qPrintable(imported.error));
+        const auto originalHash = QCryptographicHash::hash(fileBytes(original), QCryptographicHash::Sha256);
+        const auto frames = frameTimes(original);
+        const auto luma = frameLuma(original);
+        QCOMPARE(frames.size(), 90);
+        QCOMPARE(luma.size(), frames.size());
+        QVERIFY(std::abs(storedFinalHold(original) - 0.043) < 0.000002);
+        constexpr double start = 0.419731;
+        const double selectedEnd = end < 0 ? imported.media.duration : end;
+        const qint64 offset = std::llround(start * 90000);
+        QList<qint64> selected;
+        QList<int> indices;
+        for (qsizetype i = 0; i < frames.size(); ++i) {
+            const auto pts = frames.at(i).toObject().value(QStringLiteral("best_effort_timestamp")).toVariant().toLongLong();
+            if (pts >= offset && double(pts - offset) / 90000 < selectedEnd - start) {
+                selected.append(pts - offset);
+                indices.append(int(i));
+            }
+        }
+        QVERIFY(!selected.isEmpty());
+        const QString target = path(QStringLiteral("vfr-trim-%1.mp4").arg(QString::fromLatin1(QTest::currentDataTag())));
+        const auto result = engine->exportVideo(imported.media, target, {start, end, removeAudio}, flag());
+        QVERIFY2(result.ok, qPrintable(result.error));
+        const auto outputFrames = frameTimes(target);
+        QCOMPARE(outputFrames.size(), selected.size());
+        const auto selectedLuma = frameLuma(target);
+        QCOMPARE(selectedLuma.size(), selected.size());
+        for (qsizetype i = 0; i < selected.size(); ++i) {
+            const auto pts = outputFrames.at(i).toObject().value(QStringLiteral("best_effort_timestamp")).toVariant().toLongLong();
+            QVERIFY(std::abs(pts - selected.at(i)) <= 1);
+            QVERIFY(std::abs(int(uchar(selectedLuma.at(i))) - int(uchar(luma.at(indices.at(i))))) <= 3);
+        }
+        const auto streams = inspect(target).value(QStringLiteral("streams")).toArray();
+        QCOMPARE(streams.size(), removeAudio ? 1 : 2);
+        const auto video = streams.first().toObject();
+        const auto endpoint = video.value(QStringLiteral("start_pts")).toVariant().toLongLong()
+            + video.value(QStringLiteral("duration_ts")).toVariant().toLongLong();
+        QVERIFY(std::abs(double(endpoint) / 90000 - (selectedEnd - start)) <= 2.0 / 90000);
+        const double expectedHold = (selectedEnd - start) - double(selected.last()) / 90000;
+        QVERIFY(std::abs(storedFinalHold(target) - expectedHold) <= 2.0 / 90000);
+        QCOMPARE(QCryptographicHash::hash(fileBytes(original), QCryptographicHash::Sha256), originalHash);
+        QVERIFY(noStagingFiles());
+    }
+
+    void trimUsesContainerOriginAndPreservesDelayedVideoWithAudio_data()
+    {
+        QTest::addColumn<double>("videoDelay");
+        QTest::newRow("nonzero-container-origin") << 0.0;
+        QTest::newRow("video-starts-after-audio") << 0.125;
+    }
+
+    void fractionalTrimFromMatroskaPreservesMillisecondClock()
+    {
+        const QString original = path(QStringLiteral("coarse-clock.mkv"));
+        const auto created = command(ffmpeg, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-nostdin"),
+            QStringLiteral("-i"), source, QStringLiteral("-map"), QStringLiteral("0:v:0"), QStringLiteral("-map"), QStringLiteral("0:a:0"),
+            QStringLiteral("-c"), QStringLiteral("copy"), original});
+        QVERIFY2(created.ok, created.error.constData());
+        const auto imported = engine->importMedia(original, flag());
+        QVERIFY2(imported.ok, qPrintable(imported.error));
+        const auto input = inspect(original);
+        QCOMPARE(input.value(QStringLiteral("format")).toObject().value(QStringLiteral("format_name")).toString(), QStringLiteral("matroska,webm"));
+        QCOMPARE(input.value(QStringLiteral("streams")).toArray().first().toObject().value(QStringLiteral("time_base")).toString(), QStringLiteral("1/1000"));
+        constexpr double start = 0.269770, end = 1.014321;
+        const double origin = input.value(QStringLiteral("format")).toObject().value(QStringLiteral("start_time")).toString().toDouble();
+        const qint64 offset = std::llround((origin + start) * 1000);
+        QList<qint64> expected;
+        for (const auto &value : frameTimes(original)) {
+            const auto pts = value.toObject().value(QStringLiteral("best_effort_timestamp")).toVariant().toLongLong();
+            if (pts >= offset && pts - offset < (end - start) * 1000) expected.append(pts - offset);
+        }
+        const QString target = path(QStringLiteral("coarse-clock-trim.mp4"));
+        const auto result = engine->exportVideo(imported.media, target, {start, end, false}, flag());
+        QVERIFY2(result.ok, qPrintable(result.error));
+        const auto actual = frameTimes(target);
+        QCOMPARE(actual.size(), expected.size());
+        for (qsizetype i = 0; i < actual.size(); ++i)
+            QCOMPARE(actual.at(i).toObject().value(QStringLiteral("best_effort_timestamp")).toVariant().toLongLong(), expected.at(i));
+        const auto streams = inspect(target).value(QStringLiteral("streams")).toArray();
+        QCOMPARE(streams.size(), 2);
+        const auto video = streams.first().toObject();
+        const auto endpoint = video.value(QStringLiteral("start_pts")).toVariant().toLongLong()
+            + video.value(QStringLiteral("duration_ts")).toVariant().toLongLong();
+        QVERIFY(std::abs(endpoint / 1000.0 - (end - start)) <= 0.002);
+    }
+
+    void trimUsesContainerOriginAndPreservesDelayedVideoWithAudio()
+    {
+        QFETCH(double, videoDelay);
+        const QString original = path(QStringLiteral("offset-%1.mp4").arg(QString::fromLatin1(QTest::currentDataTag())));
+        const auto created = command(ffmpeg, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-nostdin"),
+            QStringLiteral("-i"), source, QStringLiteral("-map"), QStringLiteral("0:v:0"), QStringLiteral("-map"), QStringLiteral("0:a:0"),
+            QStringLiteral("-vf"), QStringLiteral("setpts=PTS+%1/TB").arg(videoDelay, 0, 'f', 6),
+            QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-fps_mode"), QStringLiteral("passthrough"),
+            QStringLiteral("-c:a"), QStringLiteral("aac"), QStringLiteral("-output_ts_offset"), QStringLiteral("5"), original});
+        QVERIFY2(created.ok, created.error.constData());
+        const auto imported = engine->importMedia(original, flag());
+        QVERIFY2(imported.ok, qPrintable(imported.error));
+        const auto input = inspect(original);
+        const double origin = input.value(QStringLiteral("format")).toObject().value(QStringLiteral("start_time")).toString().toDouble();
+        QVERIFY(origin > 4.9);
+        const auto sourceFrames = frameTimes(original);
+        QList<double> expected;
+        for (const auto &value : sourceFrames) {
+            const double pts = value.toObject().value(QStringLiteral("best_effort_timestamp_time")).toString().toDouble() - origin - 0.271;
+            if (pts >= 0 && pts < 0.743) expected.append(pts);
+        }
+        const QString target = path(QStringLiteral("offset-trim-%1.mp4").arg(QString::fromLatin1(QTest::currentDataTag())));
+        const auto result = engine->exportVideo(imported.media, target, {0.271, 1.014, false}, flag());
+        QVERIFY2(result.ok, qPrintable(result.error));
+        const auto actual = frameTimes(target);
+        QCOMPARE(actual.size(), expected.size());
+        for (qsizetype i = 0; i < actual.size(); ++i)
+            QVERIFY(std::abs(actual.at(i).toObject().value(QStringLiteral("best_effort_timestamp_time")).toString().toDouble() - expected.at(i)) < 0.0001);
+        QCOMPARE(inspect(target).value(QStringLiteral("streams")).toArray().size(), 2);
+    }
+
+    void decodableExportWithMissingFrameOrShortenedHoldIsRejected_data()
+    {
+        QTest::addColumn<QByteArray>("fault");
+        QTest::newRow("missing-interior-frame") << QByteArrayLiteral("drop_frame");
+        QTest::newRow("shortened-final-hold") << QByteArrayLiteral("short_hold");
+    }
+
+    void trimEndpointFallsBackToVideoFramesWhenStreamTimingIsMissing_data()
+    {
+        QTest::addColumn<QByteArray>("missing");
+        QTest::newRow("missing-start-pts") << QByteArrayLiteral("start_pts");
+        QTest::newRow("missing-video-origin-and-duration") << QByteArrayLiteral("all");
+    }
+
+    void trimEndpointFallsBackToVideoFramesWhenStreamTimingIsMissing()
+    {
+#ifdef Q_OS_UNIX
+        QFETCH(QByteArray, missing);
+        const QString original = path(QStringLiteral("missing-timing-%1.mp4").arg(QString::fromLatin1(missing)));
+        const auto created = createVariableRateVideo(original);
+        QVERIFY2(created.ok, created.error.constData());
+        const auto actualVideo = inspect(original).value(QStringLiteral("streams")).toArray().first().toObject();
+        const double sourceEnd = actualVideo.value(QStringLiteral("duration_ts")).toVariant().toLongLong() / 90000.0;
+        const QString wrapper = path(QStringLiteral("missing-timing-probe-%1").arg(QString::fromLatin1(missing)));
+        QVERIFY(write(wrapper, QByteArrayLiteral(
+            "#!/usr/bin/env python3\n"
+            "import json, os, subprocess, sys\n"
+            "args = sys.argv[1:]\n"
+            "result = subprocess.run([os.environ['FRAMECUT_REAL_FFPROBE'], *args], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)\n"
+            "output = result.stdout\n"
+            "if result.returncode == 0 and '-show_streams' in args and args[-1] == os.environ['FRAMECUT_METADATA_SOURCE']:\n"
+            "    data = json.loads(output)\n"
+            "    for stream in data['streams']:\n"
+            "        if stream.get('codec_type') != 'video': continue\n"
+            "        fields = ['start_pts'] if os.environ['FRAMECUT_MISSING_TIMING'] == 'start_pts' else ['start_pts', 'start_time', 'duration_ts', 'duration']\n"
+            "        for field in fields: stream.pop(field, None)\n"
+            "    output = json.dumps(data).encode()\n"
+            "sys.stdout.buffer.write(output)\n"
+            "sys.exit(result.returncode)\n")));
+        QVERIFY(QFile::setPermissions(wrapper, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        qputenv("FRAMECUT_REAL_FFPROBE", QFile::encodeName(ffprobe));
+        qputenv("FRAMECUT_METADATA_SOURCE", QFile::encodeName(original));
+        qputenv("FRAMECUT_MISSING_TIMING", missing);
+        MediaEngine incomplete(ffmpeg, wrapper, path(QStringLiteral("missing-timing-cache")));
+        const auto imported = incomplete.importMedia(original, flag());
+        const QString target = path(QStringLiteral("missing-timing-export-%1.mp4").arg(QString::fromLatin1(missing)));
+        const auto result = imported.ok ? incomplete.exportVideo(imported.media, target, {0.419731, -1, true}, flag()) : ExportResult{};
+        qunsetenv("FRAMECUT_REAL_FFPROBE");
+        qunsetenv("FRAMECUT_METADATA_SOURCE");
+        qunsetenv("FRAMECUT_MISSING_TIMING");
+        QVERIFY2(imported.ok, qPrintable(imported.error));
+        if (missing == QByteArrayLiteral("all")) QVERIFY(imported.media.duration > sourceEnd + 0.3);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        const auto video = inspect(target).value(QStringLiteral("streams")).toArray().first().toObject();
+        const auto endpoint = video.value(QStringLiteral("start_pts")).toVariant().toLongLong()
+            + video.value(QStringLiteral("duration_ts")).toVariant().toLongLong();
+        QVERIFY(std::abs(endpoint / 90000.0 - (sourceEnd - 0.419731)) <= 2.0 / 90000);
+        QVERIFY(std::abs(storedFinalHold(target) - 0.043) <= 2.0 / 90000);
+#else
+        QSKIP("The metadata fault-injection executable uses a Unix Python interpreter.");
+#endif
+    }
+
+    void decodableExportWithMissingFrameOrShortenedHoldIsRejected()
+    {
+#ifdef Q_OS_UNIX
+        QFETCH(QByteArray, fault);
+        const QString original = path(QStringLiteral("fault-source-%1.mp4").arg(QString::fromLatin1(fault)));
+        const auto created = createVariableRateVideo(original);
+        QVERIFY2(created.ok, created.error.constData());
+        const auto imported = engine->importMedia(original, flag());
+        QVERIFY2(imported.ok, qPrintable(imported.error));
+        const QString wrapper = path(QStringLiteral("fault-ffmpeg-%1").arg(QString::fromLatin1(fault)));
+        QVERIFY(write(wrapper, QByteArrayLiteral(
+            "#!/usr/bin/env python3\n"
+            "import os, shutil, subprocess, sys\n"
+            "args = sys.argv[1:]\n"
+            "if os.environ['FRAMECUT_FAULT_KIND'] == 'drop_frame':\n"
+            "    args[-1:-1] = ['-vf', \"select='not(eq(n,5))'\"]\n"
+            "else:\n"
+            "    args[args.index('-bsf:v') + 1] = \"setts=pts=PTS:dts=DTS:duration='if(eq(NEXT_PTS,NOPTS),1/(60*TB),NEXT_PTS-PTS)'\"\n"
+            "result = subprocess.run([os.environ['FRAMECUT_REAL_FFMPEG'], *args], stdin=subprocess.DEVNULL)\n"
+            "if result.returncode == 0:\n"
+            "    shutil.copyfile(args[-1], os.environ['FRAMECUT_FAULT_CAPTURE'])\n"
+            "sys.exit(result.returncode)\n")));
+        QVERIFY(QFile::setPermissions(wrapper, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        const QString captured = path(QStringLiteral("fault-captured-%1.mp4").arg(QString::fromLatin1(fault)));
+        qputenv("FRAMECUT_REAL_FFMPEG", QFile::encodeName(ffmpeg));
+        qputenv("FRAMECUT_FAULT_KIND", fault);
+        qputenv("FRAMECUT_FAULT_CAPTURE", QFile::encodeName(captured));
+        MediaEngine faulty(wrapper, ffprobe, path(QStringLiteral("fault-cache")));
+        const QString target = path(QStringLiteral("fault-published-%1.mp4").arg(QString::fromLatin1(fault)));
+        const auto result = faulty.exportVideo(imported.media, target, {0.419731, -1, true}, flag());
+        qunsetenv("FRAMECUT_REAL_FFMPEG");
+        qunsetenv("FRAMECUT_FAULT_KIND");
+        qunsetenv("FRAMECUT_FAULT_CAPTURE");
+        QVERIFY(!result.ok && !result.cancelled);
+        QVERIFY2(result.error.contains(QStringLiteral("verification")), qPrintable(result.error));
+        QVERIFY(!QFileInfo::exists(target));
+        QVERIFY(noStagingFiles());
+        const auto decoded = frameLuma(captured);
+        QVERIFY(!decoded.isEmpty()); // Both corruptions are valid, decodable MP4s.
+        if (fault == QByteArrayLiteral("short_hold"))
+            QVERIFY(std::abs(storedFinalHold(captured) - 1.0 / 60) < 0.000002);
+#else
+        QSKIP("The fault-injection executable uses a Unix Python interpreter.");
+#endif
     }
 
     void trimBeyondShorterAudioTrackCanExportSilence()
